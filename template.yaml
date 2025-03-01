@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Auto Scaling Group with Apache Web Server and Load Balancer'
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 1, !GetAZs ]
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+    DependsOn: InternetGateway
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGateway
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+    DependsOn: NatGatewayEIP
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn: GatewayAttachment
+
+  PublicSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+    DependsOn: NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow HTTP access to ALB'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow HTTP from ALB'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: ALB
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Scheme: internet-facing
+      Type: application
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: true
+        - Key: deletion_protection.enabled
+          Value: false
+        - Key: load_balancing.cross_zone.enabled
+          Value: true
+    DependsOn: GatewayAttachment
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckPath: "/"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+    DependsOn: ALB
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-06ee6255945a96aba
+        InstanceType: t2.micro
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd stress
+
+            # Get instance metadata
+            # INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+
+            # Create stress script that will push CPU above 50%
+            cat > /usr/bin/stress_script.sh << 'EOF'
+            #!/bin/bash
+            # Get number of CPU cores and use all of them to ensure we go above 50% threshold
+            CORES=$(nproc)
+            stress --cpu $CORES --timeout 300
+            EOF
+            chmod +x /usr/bin/stress_script.sh
+
+            # Create index.html with the exact required format
+            cat > /var/www/html/index.html << EOF
+            <html>
+            <body>
+            <h1>Hello from $(hostname -i) / $INSTANCE_ID</h1>
+            <button onclick="fetch('/stress').then(() => alert('Stressing CPU!'))">Stress CPU</button>
+            </body>
+            </html>
+            EOF
+
+            # Create CGI script directory and stress.sh
+            mkdir -p /var/www/cgi-bin
+            cat > /var/www/cgi-bin/stress.sh << 'EOF'
+            #!/bin/bash
+            echo "Content-type: text/plain"
+            echo ""
+            /usr/bin/stress_script.sh &
+            echo "CPU stress started"
+            EOF
+            chmod +x /var/www/cgi-bin/stress.sh
+
+            # Configure Apache
+            cat >> /etc/httpd/conf/httpd.conf << 'EOF'
+            ScriptAlias /stress /var/www/cgi-bin/stress.sh
+            <Directory "/var/www/cgi-bin">
+            AllowOverride None
+            Options +ExecCGI
+            AddHandler cgi-script .sh
+            Require all granted
+            </Directory>
+            EOF
+
+            # Start and enable httpd
+            systemctl restart httpd
+            systemctl enable httpd
+
+            
+    DependsOn: EC2SecurityGroup
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      DesiredCapacity: 1
+      MaxSize: 3
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+    DependsOn: ALBTargetGroup
+
+  # CPU-based scaling policy
+  CPUScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50.0
+      EstimatedInstanceWarmup: 60
+    DependsOn: AutoScalingGroup
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS Name of the Application Load Balancer
+    Value: !GetAtt ALB.DNSName
